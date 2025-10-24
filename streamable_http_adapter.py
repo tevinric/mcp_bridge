@@ -32,6 +32,7 @@ class AsyncStreamReader:
     def __init__(self):
         self.queue = asyncio.Queue()
         self._closed = False
+        self._buffer = b""
 
     async def __aenter__(self):
         return self
@@ -40,29 +41,71 @@ class AsyncStreamReader:
         self._closed = True
         return False
 
+    def __aiter__(self):
+        """Return self as async iterator."""
+        return self
+
+    async def __anext__(self):
+        """Read next line for async iteration."""
+        line = await self.readline()
+        if not line and self._closed:
+            raise StopAsyncIteration
+        return line
+
     async def read(self, n: int = -1) -> bytes:
         """Read up to n bytes from the stream."""
-        if self._closed and self.queue.empty():
+        if self._closed and self.queue.empty() and not self._buffer:
             return b""
 
         try:
-            data = await asyncio.wait_for(self.queue.get(), timeout=0.1)
-            return data
+            # Get more data if buffer is empty
+            if not self._buffer and not self.queue.empty():
+                data = await asyncio.wait_for(self.queue.get(), timeout=0.1)
+                self._buffer += data
         except asyncio.TimeoutError:
-            return b""
+            pass
+
+        if n == -1:
+            result = self._buffer
+            self._buffer = b""
+            return result
+        else:
+            result = self._buffer[:n]
+            self._buffer = self._buffer[n:]
+            return result
 
     async def readline(self) -> bytes:
         """Read a line from the stream."""
-        if self._closed and self.queue.empty():
-            return b""
+        while True:
+            # Check if we have a newline in the buffer
+            newline_pos = self._buffer.find(b'\n')
+            if newline_pos != -1:
+                line = self._buffer[:newline_pos + 1]
+                self._buffer = self._buffer[newline_pos + 1:]
+                return line
 
-        try:
-            data = await asyncio.wait_for(self.queue.get(), timeout=0.1)
-            if not data.endswith(b'\n'):
-                data += b'\n'
-            return data
-        except asyncio.TimeoutError:
-            return b""
+            # If closed and no more data, return what we have
+            if self._closed and self.queue.empty():
+                if self._buffer:
+                    line = self._buffer
+                    self._buffer = b""
+                    return line
+                return b""
+
+            # Try to get more data
+            try:
+                data = await asyncio.wait_for(self.queue.get(), timeout=0.1)
+                self._buffer += data
+            except asyncio.TimeoutError:
+                # If we have data in buffer and queue is empty, return it
+                if self._buffer and self.queue.empty():
+                    line = self._buffer
+                    self._buffer = b""
+                    return line
+                # Otherwise continue waiting
+                if self._closed:
+                    return b""
+                continue
 
     async def readexactly(self, n: int) -> bytes:
         """Read exactly n bytes from the stream."""
@@ -74,6 +117,10 @@ class AsyncStreamReader:
     def feed_data(self, data: bytes):
         """Feed data into the stream."""
         self.queue.put_nowait(data)
+
+    def feed_eof(self):
+        """Signal end of stream."""
+        self._closed = True
 
 
 class AsyncStreamWriter:
@@ -149,6 +196,8 @@ async def mcp_handler(request: web.Request) -> web.StreamResponse:
 
     # Feed the request data into the input stream
     input_stream.feed_data(request_data)
+    # Signal EOF so the stream knows there's no more data coming
+    input_stream.feed_eof()
 
     # Run the MCP server in a background task
     async def run_mcp_server():

@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python quick_test.py:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
