@@ -2,12 +2,8 @@
 """
 Streamable HTTP -> MCP stdio bridge for markitdown_mcp_server.
 
-Place this file at the repository root (next to pyproject.toml / src/).
-Run it inside the existing repository image while mounting your repo into /app.
-
-This adapter:
-- Accepts POST /mcp with chunked request body (raw MCP messages).
-- Returns chunked response streaming MCP outputs.
+This adapter creates an HTTP server that accepts MCP messages and forwards them
+to the MCP server, returning responses via SSE (Server-Sent Events).
 """
 import asyncio
 import json
@@ -15,9 +11,6 @@ import logging
 import sys
 import os
 from aiohttp import web
-from mcp import types
-from mcp.server import NotificationOptions
-from mcp.server.models import InitializationOptions
 
 # Add the src directory to the Python path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
@@ -33,148 +26,180 @@ logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 
+class AsyncStreamReader:
+    """Async stream reader that reads from a queue."""
+
+    def __init__(self):
+        self.queue = asyncio.Queue()
+        self._closed = False
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        self._closed = True
+        return False
+
+    async def read(self, n: int = -1) -> bytes:
+        """Read up to n bytes from the stream."""
+        if self._closed and self.queue.empty():
+            return b""
+
+        try:
+            data = await asyncio.wait_for(self.queue.get(), timeout=0.1)
+            return data
+        except asyncio.TimeoutError:
+            return b""
+
+    async def readline(self) -> bytes:
+        """Read a line from the stream."""
+        if self._closed and self.queue.empty():
+            return b""
+
+        try:
+            data = await asyncio.wait_for(self.queue.get(), timeout=0.1)
+            if not data.endswith(b'\n'):
+                data += b'\n'
+            return data
+        except asyncio.TimeoutError:
+            return b""
+
+    async def readexactly(self, n: int) -> bytes:
+        """Read exactly n bytes from the stream."""
+        data = await self.read(n)
+        if len(data) < n:
+            raise asyncio.IncompleteReadError(data, n)
+        return data
+
+    def feed_data(self, data: bytes):
+        """Feed data into the stream."""
+        self.queue.put_nowait(data)
+
+
+class AsyncStreamWriter:
+    """Async stream writer that writes to a queue."""
+
+    def __init__(self):
+        self.queue = asyncio.Queue()
+        self._closed = False
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        self._closed = True
+        return False
+
+    async def write(self, data: bytes):
+        """Write data to the stream."""
+        if not self._closed:
+            await self.queue.put(data)
+
+    async def drain(self):
+        """Drain the stream (no-op for queue-based writer)."""
+        pass
+
+    async def close(self):
+        """Close the stream."""
+        self._closed = True
+
+    async def get_data(self) -> bytes:
+        """Get data from the stream."""
+        try:
+            return await asyncio.wait_for(self.queue.get(), timeout=0.1)
+        except asyncio.TimeoutError:
+            return b""
+
+
 async def mcp_handler(request: web.Request) -> web.StreamResponse:
+    """Handle MCP requests over HTTP with SSE streaming."""
     logger.debug("Received MCP request")
 
     resp = web.StreamResponse(
         status=200,
         reason="OK",
         headers={
-            "Content-Type": "application/json",
-            "Transfer-Encoding": "chunked",
+            "Content-Type": "text/event-stream",
             "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
         },
     )
     await resp.prepare(request)
 
-    # Read the entire request body
+    # Read the request body
     try:
         request_data = await request.read()
-        logger.debug(f"Request data: {request_data}")
+        logger.debug(f"Request data: {request_data[:200]}")
 
         if not request_data:
             logger.error("Empty request body")
-            await resp.write(b'{"error": "Empty request body"}\n')
+            await resp.write(b'data: {"error": "Empty request body"}\n\n')
+            await resp.write_eof()
             return resp
 
     except Exception as e:
         logger.error(f"Error reading request: {e}")
-        await resp.write(json.dumps({"error": str(e)}).encode() + b"\n")
+        await resp.write(f'data: {json.dumps({"error": str(e)})}\n\n'.encode())
+        await resp.write_eof()
         return resp
 
-    # Parse the incoming JSON-RPC message
+    # Create input/output streams
+    input_stream = AsyncStreamReader()
+    output_stream = AsyncStreamWriter()
+
+    # Feed the request data into the input stream
+    input_stream.feed_data(request_data)
+
+    # Run the MCP server in a background task
+    async def run_mcp_server():
+        try:
+            from mcp.server.models import InitializationOptions
+            from mcp.server import NotificationOptions
+
+            async with input_stream, output_stream:
+                await mcp_module.app.run(
+                    input_stream,
+                    output_stream,
+                    InitializationOptions(
+                        server_name="markitdown_mcp_server",
+                        server_version="0.1.0",
+                        capabilities=mcp_module.app.get_capabilities(
+                            notification_options=NotificationOptions(),
+                            experimental_capabilities={},
+                        ),
+                    ),
+                )
+        except Exception as e:
+            logger.error(f"MCP server error: {e}", exc_info=True)
+            await output_stream.write(
+                json.dumps({
+                    "jsonrpc": "2.0",
+                    "id": None,
+                    "error": {"code": -32603, "message": str(e)}
+                }).encode() + b"\n"
+            )
+
+    # Start the MCP server task
+    server_task = asyncio.create_task(run_mcp_server())
+
+    # Stream the output back to the client
     try:
-        message_text = request_data.decode("utf-8")
-        logger.debug(f"Decoded message: {message_text}")
-    except Exception as e:
-        logger.error(f"Error decoding request: {e}")
-        await resp.write(
-            json.dumps({"error": f"Decode error: {str(e)}"}).encode() + b"\n"
-        )
-        return resp
-
-    # Create input/output streams for MCP
-    class StringIOAdapter:
-        def __init__(self, data: str):
-            self._data = data.encode("utf-8") + b"\n"
-            self._pos = 0
-
-        async def read(self, n: int = -1) -> bytes:
-            if self._pos >= len(self._data):
-                return b""
-
-            if n == -1:
-                result = self._data[self._pos :]
-                self._pos = len(self._data)
+        while not server_task.done() or not output_stream.queue.empty():
+            data = await output_stream.get_data()
+            if data:
+                logger.debug(f"Sending data: {data[:200]}")
+                # Send as SSE format
+                await resp.write(b"data: " + data.rstrip(b"\n") + b"\n\n")
             else:
-                result = self._data[self._pos : self._pos + n]
-                self._pos += len(result)
+                # Small delay to prevent tight loop
+                await asyncio.sleep(0.01)
 
-            return result
-
-        async def readexactly(self, n: int) -> bytes:
-            data = await self.read(n)
-            if len(data) < n:
-                raise asyncio.IncompleteReadError(data, n)
-            return data
-
-        async def readline(self) -> bytes:
-            start = self._pos
-            while (
-                self._pos < len(self._data)
-                and self._data[self._pos : self._pos + 1] != b"\n"
-            ):
-                self._pos += 1
-
-            if self._pos < len(self._data):
-                self._pos += 1  # Include the newline
-
-            return self._data[start : self._pos]
-
-    class ResponseCollector:
-        def __init__(self):
-            self._responses = []
-
-        async def write(self, data: bytes):
-            self._responses.append(data)
-
-        async def drain(self):
-            pass
-
-        async def close(self):
-            pass
-
-        def get_response(self) -> bytes:
-            return b"".join(self._responses)
-
-    input_stream = StringIOAdapter(message_text)
-    output_collector = ResponseCollector()
-
-    # Run the MCP server
-    try:
-        logger.debug("Starting MCP server")
-
-        # Use the existing server instance directly
-        await mcp_module.app.run(
-            input_stream,
-            output_collector,
-            InitializationOptions(
-                server_name="markitdown_stream_http",
-                server_version="0.1.0",
-                capabilities=mcp_module.app.get_capabilities(
-                    notification_options=NotificationOptions(),
-                    experimental_capabilities={},
-                ),
-            ),
-        )
-
-        # Get the response and send it
-        response_data = output_collector.get_response()
-        logger.debug(f"MCP response: {response_data}")
-
-        if response_data:
-            await resp.write(response_data)
-        else:
-            # Send a default response if nothing was collected
-            default_response = {
-                "jsonrpc": "2.0",
-                "id": 0,
-                "result": {
-                    "protocolVersion": "2025-06-18",
-                    "capabilities": {},
-                    "serverInfo": {"name": "markitdown_mcp_server", "version": "0.1.0"},
-                },
-            }
-            await resp.write(json.dumps(default_response).encode() + b"\n")
+        # Wait for server task to complete
+        await server_task
 
     except Exception as e:
-        logger.error(f"MCP server error: {e}", exc_info=True)
-        error_response = {
-            "jsonrpc": "2.0",
-            "id": 0,
-            "error": {"code": -32603, "message": str(e)},
-        }
-        await resp.write(json.dumps(error_response).encode() + b"\n")
+        logger.error(f"Error streaming response: {e}", exc_info=True)
+        await resp.write(f'data: {json.dumps({"error": str(e)})}\n\n'.encode())
 
     try:
         await resp.write_eof()
@@ -185,12 +210,19 @@ async def mcp_handler(request: web.Request) -> web.StreamResponse:
 
 
 async def health(request):
+    """Health check endpoint."""
     return web.Response(text="ok")
 
 
 def main(host="0.0.0.0", port=8080):
+    """Start the HTTP server."""
     app = web.Application()
-    app.add_routes([web.post("/mcp", mcp_handler), web.get("/health", health)])
+    app.add_routes([
+        web.post("/mcp", mcp_handler),
+        web.get("/health", health)
+    ])
+
+    logger.info(f"Starting server on {host}:{port}")
     web.run_app(app, host=host, port=port)
 
 
