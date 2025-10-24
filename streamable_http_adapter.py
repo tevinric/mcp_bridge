@@ -3,7 +3,7 @@
 Streamable HTTP -> MCP stdio bridge for markitdown_mcp_server.
 
 This adapter creates an HTTP server that accepts MCP messages and forwards them
-to the MCP server, returning responses via SSE (Server-Sent Events).
+to the MCP server using proper async streams.
 """
 import asyncio
 import json
@@ -26,136 +26,97 @@ logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 
-class AsyncStreamReader:
-    """Async stream reader that reads from a queue."""
+class MemoryReader:
+    """Memory-based stream reader compatible with MCP."""
 
     def __init__(self):
-        self.queue = asyncio.Queue()
-        self._closed = False
-        self._buffer = b""
+        self._data = b""
+        self._position = 0
+        self._eof = False
 
-    async def __aenter__(self):
-        return self
+    def write(self, data: bytes):
+        """Write data to the stream."""
+        self._data += data
 
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        self._closed = True
-        return False
-
-    def __aiter__(self):
-        """Return self as async iterator."""
-        return self
-
-    async def __anext__(self):
-        """Read next line for async iteration."""
-        line = await self.readline()
-        if not line and self._closed:
-            raise StopAsyncIteration
-        return line
+    def set_eof(self):
+        """Mark end of stream."""
+        self._eof = True
 
     async def read(self, n: int = -1) -> bytes:
-        """Read up to n bytes from the stream."""
-        if self._closed and self.queue.empty() and not self._buffer:
-            return b""
-
-        try:
-            # Get more data if buffer is empty
-            if not self._buffer and not self.queue.empty():
-                data = await asyncio.wait_for(self.queue.get(), timeout=0.1)
-                self._buffer += data
-        except asyncio.TimeoutError:
-            pass
+        """Read n bytes from the stream."""
+        if self._position >= len(self._data):
+            if self._eof:
+                return b""
+            # Wait a bit for more data
+            await asyncio.sleep(0.01)
+            if self._position >= len(self._data):
+                return b""
 
         if n == -1:
-            result = self._buffer
-            self._buffer = b""
-            return result
+            result = self._data[self._position:]
+            self._position = len(self._data)
         else:
-            result = self._buffer[:n]
-            self._buffer = self._buffer[n:]
-            return result
+            end = min(self._position + n, len(self._data))
+            result = self._data[self._position:end]
+            self._position = end
+
+        return result
 
     async def readline(self) -> bytes:
         """Read a line from the stream."""
-        while True:
-            # Check if we have a newline in the buffer
-            newline_pos = self._buffer.find(b'\n')
-            if newline_pos != -1:
-                line = self._buffer[:newline_pos + 1]
-                self._buffer = self._buffer[newline_pos + 1:]
-                return line
+        start = self._position
 
-            # If closed and no more data, return what we have
-            if self._closed and self.queue.empty():
-                if self._buffer:
-                    line = self._buffer
-                    self._buffer = b""
-                    return line
-                return b""
+        # Look for newline
+        while self._position < len(self._data):
+            if self._data[self._position:self._position + 1] == b'\n':
+                self._position += 1
+                return self._data[start:self._position]
+            self._position += 1
 
-            # Try to get more data
-            try:
-                data = await asyncio.wait_for(self.queue.get(), timeout=0.1)
-                self._buffer += data
-            except asyncio.TimeoutError:
-                # If we have data in buffer and queue is empty, return it
-                if self._buffer and self.queue.empty():
-                    line = self._buffer
-                    self._buffer = b""
-                    return line
-                # Otherwise continue waiting
-                if self._closed:
-                    return b""
-                continue
+        # No newline found
+        if self._eof and start < len(self._data):
+            # Return remaining data
+            result = self._data[start:]
+            self._position = len(self._data)
+            return result
+
+        if self._eof:
+            return b""
+
+        # Reset position and wait
+        self._position = start
+        await asyncio.sleep(0.01)
+        return b""
 
     async def readexactly(self, n: int) -> bytes:
-        """Read exactly n bytes from the stream."""
-        data = await self.read(n)
-        if len(data) < n:
-            raise asyncio.IncompleteReadError(data, n)
-        return data
-
-    def feed_data(self, data: bytes):
-        """Feed data into the stream."""
-        self.queue.put_nowait(data)
-
-    def feed_eof(self):
-        """Signal end of stream."""
-        self._closed = True
+        """Read exactly n bytes."""
+        result = await self.read(n)
+        if len(result) < n:
+            raise asyncio.IncompleteReadError(result, n)
+        return result
 
 
-class AsyncStreamWriter:
-    """Async stream writer that writes to a queue."""
+class MemoryWriter:
+    """Memory-based stream writer compatible with MCP."""
 
     def __init__(self):
-        self.queue = asyncio.Queue()
-        self._closed = False
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        self._closed = True
-        return False
+        self._data = []
 
     async def write(self, data: bytes):
         """Write data to the stream."""
-        if not self._closed:
-            await self.queue.put(data)
+        self._data.append(data)
 
     async def drain(self):
-        """Drain the stream (no-op for queue-based writer)."""
+        """Drain the stream."""
         pass
 
     async def close(self):
         """Close the stream."""
-        self._closed = True
+        pass
 
-    async def get_data(self) -> bytes:
-        """Get data from the stream."""
-        try:
-            return await asyncio.wait_for(self.queue.get(), timeout=0.1)
-        except asyncio.TimeoutError:
-            return b""
+    def get_data(self) -> bytes:
+        """Get all written data."""
+        return b"".join(self._data)
 
 
 async def mcp_handler(request: web.Request) -> web.StreamResponse:
@@ -166,9 +127,8 @@ async def mcp_handler(request: web.Request) -> web.StreamResponse:
         status=200,
         reason="OK",
         headers={
-            "Content-Type": "text/event-stream",
+            "Content-Type": "application/json",
             "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
         },
     )
     await resp.prepare(request)
@@ -180,75 +140,144 @@ async def mcp_handler(request: web.Request) -> web.StreamResponse:
 
         if not request_data:
             logger.error("Empty request body")
-            await resp.write(b'data: {"error": "Empty request body"}\n\n')
+            error_resp = {
+                "jsonrpc": "2.0",
+                "id": None,
+                "error": {"code": -32600, "message": "Empty request body"}
+            }
+            await resp.write(json.dumps(error_resp).encode() + b"\n")
             await resp.write_eof()
             return resp
 
     except Exception as e:
         logger.error(f"Error reading request: {e}")
-        await resp.write(f'data: {json.dumps({"error": str(e)})}\n\n'.encode())
+        error_resp = {
+            "jsonrpc": "2.0",
+            "id": None,
+            "error": {"code": -32603, "message": str(e)}
+        }
+        await resp.write(json.dumps(error_resp).encode() + b"\n")
         await resp.write_eof()
         return resp
 
-    # Create input/output streams
-    input_stream = AsyncStreamReader()
-    output_stream = AsyncStreamWriter()
+    # Parse the JSON-RPC message
+    try:
+        message = json.loads(request_data.decode('utf-8'))
+        logger.debug(f"Parsed message: {message}")
+    except json.JSONDecodeError as e:
+        logger.error(f"Invalid JSON: {e}")
+        error_resp = {
+            "jsonrpc": "2.0",
+            "id": None,
+            "error": {"code": -32700, "message": f"Parse error: {str(e)}"}
+        }
+        await resp.write(json.dumps(error_resp).encode() + b"\n")
+        await resp.write_eof()
+        return resp
 
-    # Feed the request data into the input stream
-    input_stream.feed_data(request_data)
-    # Signal EOF so the stream knows there's no more data coming
-    input_stream.feed_eof()
+    # Handle the message directly based on method
+    try:
+        method = message.get("method")
+        msg_id = message.get("id")
+        params = message.get("params", {})
 
-    # Run the MCP server in a background task
-    async def run_mcp_server():
-        try:
-            from mcp.server.models import InitializationOptions
+        if method == "initialize":
+            # Handle initialize
             from mcp.server import NotificationOptions
 
-            async with input_stream, output_stream:
-                await mcp_module.app.run(
-                    input_stream,
-                    output_stream,
-                    InitializationOptions(
-                        server_name="markitdown_mcp_server",
-                        server_version="0.1.0",
-                        capabilities=mcp_module.app.get_capabilities(
-                            notification_options=NotificationOptions(),
-                            experimental_capabilities={},
-                        ),
-                    ),
-                )
-        except Exception as e:
-            logger.error(f"MCP server error: {e}", exc_info=True)
-            await output_stream.write(
-                json.dumps({
-                    "jsonrpc": "2.0",
-                    "id": None,
-                    "error": {"code": -32603, "message": str(e)}
-                }).encode() + b"\n"
-            )
+            result = {
+                "jsonrpc": "2.0",
+                "id": msg_id,
+                "result": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {
+                        "prompts": {
+                            "listChanged": False
+                        }
+                    },
+                    "serverInfo": {
+                        "name": "markitdown_mcp_server",
+                        "version": "0.1.0"
+                    }
+                }
+            }
+            await resp.write(json.dumps(result).encode() + b"\n")
 
-    # Start the MCP server task
-    server_task = asyncio.create_task(run_mcp_server())
+        elif method == "prompts/list":
+            # Get prompts from the server
+            prompts_list = await mcp_module.list_prompts()
 
-    # Stream the output back to the client
-    try:
-        while not server_task.done() or not output_stream.queue.empty():
-            data = await output_stream.get_data()
-            if data:
-                logger.debug(f"Sending data: {data[:200]}")
-                # Send as SSE format
-                await resp.write(b"data: " + data.rstrip(b"\n") + b"\n\n")
-            else:
-                # Small delay to prevent tight loop
-                await asyncio.sleep(0.01)
+            result = {
+                "jsonrpc": "2.0",
+                "id": msg_id,
+                "result": {
+                    "prompts": [
+                        {
+                            "name": p.name,
+                            "description": p.description,
+                            "arguments": [
+                                {
+                                    "name": arg.name,
+                                    "description": arg.description,
+                                    "required": arg.required
+                                }
+                                for arg in (p.arguments or [])
+                            ]
+                        }
+                        for p in prompts_list
+                    ]
+                }
+            }
+            await resp.write(json.dumps(result).encode() + b"\n")
 
-        # Wait for server task to complete
-        await server_task
+        elif method == "prompts/get":
+            # Get a specific prompt
+            name = params.get("name")
+            arguments = params.get("arguments")
+
+            prompt_result = await mcp_module.get_prompt(name, arguments)
+
+            result = {
+                "jsonrpc": "2.0",
+                "id": msg_id,
+                "result": {
+                    "messages": [
+                        {
+                            "role": msg.role,
+                            "content": {
+                                "type": msg.content.type,
+                                "text": msg.content.text
+                            }
+                        }
+                        for msg in prompt_result.messages
+                    ]
+                }
+            }
+            await resp.write(json.dumps(result).encode() + b"\n")
+
+        else:
+            # Unknown method
+            error_resp = {
+                "jsonrpc": "2.0",
+                "id": msg_id,
+                "error": {
+                    "code": -32601,
+                    "message": f"Method not found: {method}"
+                }
+            }
+            await resp.write(json.dumps(error_resp).encode() + b"\n")
 
     except Exception as e:
-        logger.error(f"Error streaming response: {e}", exc_info=True)
-        await resp.write(f'data: {json.dumps({"error": str(e)})}\n\n'.encode())
+        logger.error(f"Error handling request: {e}", exc_info=True)
+        error_resp = {
+            "jsonrpc": "2.0",
+            "id": message.get("id") if isinstance(message, dict) else None,
+            "error": {
+                "code": -32603,
+                "message": f"Internal error: {str(e)}"
+            }
+        }
+        await resp.write(json.dumps(error_resp).encode() + b"\n")
 
     try:
         await resp.write_eof()
